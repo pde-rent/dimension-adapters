@@ -177,11 +177,11 @@ const breakdownMethodology = {
   },
   Revenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee.",
-    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee; on a cross-asset withdrawal it also holds the protocol slice of the coverage toll, which the event does not log apart.",
   },
   ProtocolRevenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee, sent to the BTR treasury.",
-    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee, booked to the BTR treasury.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee (plus, on a cross-asset withdrawal, the coverage toll's protocol slice), booked to the BTR treasury.",
   },
   SupplySideRevenue: {
     "Swap Fees To LPs": "LP share (lpFee) of the swap fee, accrued to the output leg's liquidity providers.",
