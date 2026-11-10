@@ -34,7 +34,8 @@ import { CHAIN } from "../../helpers/chains";
 // - `swapLiability` (`lpAmountOut > 0`): the minted claim's token value, `previewWithdraw` face
 //   (amountOut + haircut) of `lpAmountOut` `tokenOut` shares at the window's end block.
 // v1 logs no route fee on either, so v1 conversions add volume only; v2's `LiabilitySwapped` carries
-// it (`fees`, tokenOut units) and it is booked like a swap fee, protocol and LP shares apart.
+// it (`fees`, route-only, tokenOut units) and it is booked like a swap fee, protocol and LP shares
+// apart; its `tolls`, like a swap's coverage toll, are not fees.
 const FACTORY = "0xbbbbbbbbbd5e955E20F323cA1F95f8191fD0E0BF";
 
 const SWAPPED =
@@ -42,10 +43,12 @@ const SWAPPED =
 
 const LIABILITY_SWAPPED =
   "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut)";
-// v2 pools add the conversion's route fee, packed `protoFee | lpFee << 128` in tokenOut units as on
-// `Swapped`: a trailing field is a new topic0, so v1 history keeps the fee-less shape above.
+// v2 pools append the conversion's route-only fee (`fees` = protoFee | lpFee << 128) and its gross
+// tolls (`tolls` = coverage toll | debit toll << 128), tokenOut units, packed as `Swapped` does:
+// trailing fields are a new topic0, so v1 history keeps the fee-less shape above. Tolls stay in the
+// pool's reserves and, as for swaps, are not counted as fees.
 const LIABILITY_SWAPPED_V2 =
-  "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut, uint256 fees)";
+  "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut, uint256 fees, uint256 tolls)";
 const WITHDRAWN =
   "event Withdrawn(address indexed sender, address indexed token, uint256 amount, uint256 lpAmount)";
 
@@ -154,7 +157,7 @@ const methodology = {
   Volume:
     "Input-token amount (amountIn) of every swap on BTR pools, read from the pool Swapped event and counted once per swap, including the protocol's own coop-arbitrage fills (CoopArb). Plus every liability conversion (LiabilitySwapped), counted once on its output leg: a cross-asset withdrawal (withdrawTo into another token) counts the token it paid out, read from its paired Withdrawn; a swapLiability counts the value of the claim it minted.",
   Fees:
-    "Swap fee charged on the output token of each swap (protocol share plus LP share), read from the Swapped event, plus the route fee a v2 liability conversion logs on LiabilitySwapped (v1 conversions log none). The coverage toll a swap may pay when it drains a leg below its coverage floor stays in the leg's reserves as a buffer and is not counted.",
+    "Swap fee charged on the output token of each swap (protocol share plus LP share), read from the Swapped event, plus the route-only fee a v2 liability conversion logs on LiabilitySwapped (v1 conversions log none). The coverage toll a swap may pay when it drains a leg below its coverage floor, and the coverage and debit tolls a v2 conversion logs, stay in the leg's reserves as a buffer and are not counted.",
   UserFees: "All swap fees are paid by the swapper.",
   Revenue: "Protocol share (protoFee) of the swap fee. Zero on coop fills, which book no protocol fee.",
   ProtocolRevenue: "The protocol share (protoFee) of the swap fee goes to the BTR treasury.",
@@ -177,11 +180,11 @@ const breakdownMethodology = {
   },
   Revenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee.",
-    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee; on a cross-asset withdrawal it also holds the protocol slice of the coverage toll, which the event does not log apart.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee.",
   },
   ProtocolRevenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee, sent to the BTR treasury.",
-    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee (plus, on a cross-asset withdrawal, the coverage toll's protocol slice), booked to the BTR treasury.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee, booked to the BTR treasury.",
   },
   SupplySideRevenue: {
     "Swap Fees To LPs": "LP share (lpFee) of the swap fee, accrued to the output leg's liquidity providers.",
