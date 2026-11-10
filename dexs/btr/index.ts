@@ -23,12 +23,29 @@ import { CHAIN } from "../../helpers/chains";
 // is off, and protocol revenue only where a protocol fee is switched on; the two are the same
 // identity, and a DEX with no protocol fee correctly reports zero revenue while its fees stay
 // non-zero. BTR's protocol fee is switched on for public fills and zero on the coop lane.
+//
+// Liability conversions are volume too. `LiabilitySwapped` is emitted by `withdrawTo` when the
+// LP exits into ANOTHER token than its claim (a cross-asset exit: the claim is converted through
+// the same anchor-path quote a swap uses, then paid out) and by `swapLiability` (the claim is
+// re-denominated into another leg, nothing paid out). Each is counted ONCE, on its output leg:
+// - cross exit (`lpAmountOut == 0`): the pool's next `Withdrawn(sender, tokenOut, amount, 0)` in
+//   the same transaction is the payout; `amount` of `tokenOut` is the volume, and that Withdrawn
+//   is never counted again (a same-asset withdraw is liquidity, not volume);
+// - `swapLiability` (`lpAmountOut > 0`): the minted claim's token value, `previewWithdraw` face
+//   (amountOut + haircut) of `lpAmountOut` `tokenOut` shares at the window's end block.
+// Neither logs its route fee, so they add volume only, never fees or revenue.
 const FACTORY = "0xbbbbbbbbbd5e955E20F323cA1F95f8191fD0E0BF";
 
 const SWAPPED =
   "event Swapped(address indexed sender, address indexed recipient, address indexed tokenIn, address tokenOut, uint256 amounts, uint256 fees, uint256 prices, uint256 outBook, uint256 outState)";
 
+const LIABILITY_SWAPPED =
+  "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut)";
+const WITHDRAWN =
+  "event Withdrawn(address indexed sender, address indexed token, uint256 amount, uint256 lpAmount)";
+
 const abi = {
+  previewWithdraw: "function previewWithdraw(address tk, uint256 lp) view returns (uint256 amountOut, uint256 haircut)",
   getOfficialPoolsCount: "function getOfficialPoolsCount() view returns (uint256)",
   officialPools: "function officialPools(uint256) view returns (address)",
 };
@@ -58,6 +75,45 @@ const fetch = async (options: FetchOptions) => {
     : [];
   const logs = pools.length ? await options.getLogs({ targets: pools, eventAbi: SWAPPED }) : [];
 
+  const lower = (a: string) => a.toLowerCase();
+  const positioned = (eventAbi: string): Promise<any[]> =>
+    pools.length ? options.getLogs({ targets: pools, eventAbi, entireLog: true, parseLog: true }) : Promise.resolve([]);
+  const liabilityLogs = await positioned(LIABILITY_SWAPPED);
+  const withdrawLogs = await positioned(WITHDRAWN);
+  const payouts = new Map<string, any[]>();
+  for (const w of withdrawLogs) {
+    const key = `${lower(w.transactionHash)}|${lower(w.address)}`;
+    payouts.set(key, [...(payouts.get(key) ?? []), w]);
+  }
+  const mints: { pool: string; token: string; lp: bigint }[] = [];
+  for (const l of liabilityLogs) {
+    const { sender, tokenOut, lpAmountOut } = l.args;
+    if (BigInt(lpAmountOut) > 0n) {
+      mints.push({ pool: l.address, token: tokenOut, lp: BigInt(lpAmountOut) });
+      continue;
+    }
+    // The cross exit's payout: the pool's first Withdrawn after it in the same transaction.
+    const next = (payouts.get(`${lower(l.transactionHash)}|${lower(l.address)}`) ?? [])
+      .filter((w) => Number(w.logIndex) > Number(l.logIndex))
+      .sort((a, b) => Number(a.logIndex) - Number(b.logIndex))[0];
+    if (
+      next &&
+      lower(next.args.token) === lower(tokenOut) &&
+      lower(next.args.sender) === lower(sender) &&
+      BigInt(next.args.lpAmount) === 0n
+    )
+      dailyVolume.add(tokenOut, next.args.amount, "Cross-Asset Withdrawals");
+  }
+  if (mints.length) {
+    const previews = await options.api.multiCall({
+      abi: abi.previewWithdraw,
+      calls: mints.map((m) => ({ target: m.pool, params: [m.token, m.lp.toString()] })),
+    });
+    previews.forEach((p: any, i: number) =>
+      dailyVolume.add(mints[i].token, BigInt(p.amountOut) + BigInt(p.haircut), "Liability Swaps")
+    );
+  }
+
   for (const log of logs) {
     const amounts = BigInt(log.amounts);
     const fees = BigInt(log.fees);
@@ -65,7 +121,7 @@ const fetch = async (options: FetchOptions) => {
     const lpFee = fees >> 128n;
     // Input-leg amount only, counted once per fill: the input leg is the notional the taker
     // actually moved, and the fee is charged on the output leg so it is not double-counted here.
-    dailyVolume.add(log.tokenIn, amounts & U128);
+    dailyVolume.add(log.tokenIn, amounts & U128, "Swaps");
     dailyFees.add(log.tokenOut, protoFee + lpFee, "Swap Fees");
     dailyRevenue.add(log.tokenOut, protoFee, "Swap Fees To Protocol");
     dailySupplySideRevenue.add(log.tokenOut, lpFee, "Swap Fees To LPs");
@@ -83,7 +139,7 @@ const fetch = async (options: FetchOptions) => {
 
 const methodology = {
   Volume:
-    "Input-token amount (amountIn) of every swap on BTR pools, read from the pool Swapped event and counted once per swap. Includes the protocol's own coop-arbitrage fills (CoopArb): they are real pool swaps that pay an LP fee, and while they were the only flow the series read zero.",
+    "Input-token amount (amountIn) of every swap on BTR pools, read from the pool Swapped event and counted once per swap, including the protocol's own coop-arbitrage fills (CoopArb). Plus every liability conversion (LiabilitySwapped), counted once on its output leg: a cross-asset withdrawal (withdrawTo into another token) counts the token it paid out, read from its paired Withdrawn; a swapLiability counts the value of the claim it minted.",
   Fees:
     "Swap fee charged on the output token of each swap (protocol share plus LP share), read from the Swapped event. The coverage toll a swap may pay when it drains a leg below its coverage floor stays in the leg's reserves as a buffer and is not counted.",
   UserFees: "All swap fees are paid by the swapper.",
@@ -93,6 +149,11 @@ const methodology = {
 };
 
 const breakdownMethodology = {
+  Volume: {
+    Swaps: "Input-token amount of every Swapped fill, public and coop-arbitrage.",
+    "Cross-Asset Withdrawals": "Output-token amount an LP withdrew into a different token than its claim (withdrawTo), read from the Withdrawn paired with its LiabilitySwapped.",
+    "Liability Swaps": "Value of the claim a swapLiability re-denominated into another leg (previewWithdraw face of the minted shares).",
+  },
   Fees: {
     "Swap Fees": "Swap fee charged on the output token of each swap (protocol share plus LP share).",
   },
