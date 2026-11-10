@@ -33,7 +33,8 @@ import { CHAIN } from "../../helpers/chains";
 //   is never counted again (a same-asset withdraw is liquidity, not volume);
 // - `swapLiability` (`lpAmountOut > 0`): the minted claim's token value, `previewWithdraw` face
 //   (amountOut + haircut) of `lpAmountOut` `tokenOut` shares at the window's end block.
-// Neither logs its route fee, so they add volume only, never fees or revenue.
+// v1 logs no route fee on either, so v1 conversions add volume only; v2's `LiabilitySwapped` carries
+// it (`fees`, tokenOut units) and it is booked like a swap fee, protocol and LP shares apart.
 const FACTORY = "0xbbbbbbbbbd5e955E20F323cA1F95f8191fD0E0BF";
 
 const SWAPPED =
@@ -41,6 +42,10 @@ const SWAPPED =
 
 const LIABILITY_SWAPPED =
   "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut)";
+// v2 pools add the conversion's route fee, packed `protoFee | lpFee << 128` in tokenOut units as on
+// `Swapped`: a trailing field is a new topic0, so v1 history keeps the fee-less shape above.
+const LIABILITY_SWAPPED_V2 =
+  "event LiabilitySwapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 lpAmountIn, uint256 lpAmountOut, uint256 haircut, uint256 fees)";
 const WITHDRAWN =
   "event Withdrawn(address indexed sender, address indexed token, uint256 amount, uint256 lpAmount)";
 
@@ -78,30 +83,38 @@ const fetch = async (options: FetchOptions) => {
   const lower = (a: string) => a.toLowerCase();
   const positioned = (eventAbi: string): Promise<any[]> =>
     pools.length ? options.getLogs({ targets: pools, eventAbi, entireLog: true, parseLog: true }) : Promise.resolve([]);
-  const liabilityLogs = await positioned(LIABILITY_SWAPPED);
+  const liabilityLogs = [...(await positioned(LIABILITY_SWAPPED)), ...(await positioned(LIABILITY_SWAPPED_V2))];
   const withdrawLogs = await positioned(WITHDRAWN);
+  const txPool = (l: any) => `${lower(l.transactionHash)}|${lower(l.address)}`;
+  const conversionsAt = new Map<string, number[]>();
+  for (const l of liabilityLogs) conversionsAt.set(txPool(l), [...(conversionsAt.get(txPool(l)) ?? []), Number(l.logIndex)]);
   const payouts = new Map<string, any[]>();
   for (const w of withdrawLogs) {
-    const key = `${lower(w.transactionHash)}|${lower(w.address)}`;
-    payouts.set(key, [...(payouts.get(key) ?? []), w]);
+    payouts.set(txPool(w), [...(payouts.get(txPool(w)) ?? []), w]);
   }
   const mints: { pool: string; token: string; lp: bigint }[] = [];
   for (const l of liabilityLogs) {
-    const { sender, tokenOut, lpAmountOut } = l.args;
+    const { sender, tokenOut, lpAmountOut, fees } = l.args;
+    if (fees !== undefined) {
+      const protoFee = BigInt(fees) & U128;
+      const lpFee = BigInt(fees) >> 128n;
+      dailyFees.add(tokenOut, protoFee + lpFee, "Conversion Fees");
+      dailyRevenue.add(tokenOut, protoFee, "Conversion Fees To Protocol");
+      dailySupplySideRevenue.add(tokenOut, lpFee, "Conversion Fees To LPs");
+    }
     if (BigInt(lpAmountOut) > 0n) {
       mints.push({ pool: l.address, token: tokenOut, lp: BigInt(lpAmountOut) });
       continue;
     }
-    // The cross exit's payout: the pool's first Withdrawn after it in the same transaction.
-    const next = (payouts.get(`${lower(l.transactionHash)}|${lower(l.address)}`) ?? [])
-      .filter((w) => Number(w.logIndex) > Number(l.logIndex))
+    // The cross exit's payout: the pool's first lpAmount-0 Withdrawn after it in the same
+    // transaction, before the pool's next conversion. A same-asset withdraw always burns shares,
+    // so it is never taken for the payout.
+    const at = Number(l.logIndex);
+    const until = Math.min(...(conversionsAt.get(txPool(l)) ?? []).filter((i) => i > at), Infinity);
+    const next = (payouts.get(txPool(l)) ?? [])
+      .filter((w) => Number(w.logIndex) > at && Number(w.logIndex) < until && BigInt(w.args.lpAmount) === 0n)
       .sort((a, b) => Number(a.logIndex) - Number(b.logIndex))[0];
-    if (
-      next &&
-      lower(next.args.token) === lower(tokenOut) &&
-      lower(next.args.sender) === lower(sender) &&
-      BigInt(next.args.lpAmount) === 0n
-    )
+    if (next && lower(next.args.token) === lower(tokenOut) && lower(next.args.sender) === lower(sender))
       dailyVolume.add(tokenOut, next.args.amount, "Cross-Asset Withdrawals");
   }
   if (mints.length) {
@@ -141,7 +154,7 @@ const methodology = {
   Volume:
     "Input-token amount (amountIn) of every swap on BTR pools, read from the pool Swapped event and counted once per swap, including the protocol's own coop-arbitrage fills (CoopArb). Plus every liability conversion (LiabilitySwapped), counted once on its output leg: a cross-asset withdrawal (withdrawTo into another token) counts the token it paid out, read from its paired Withdrawn; a swapLiability counts the value of the claim it minted.",
   Fees:
-    "Swap fee charged on the output token of each swap (protocol share plus LP share), read from the Swapped event. The coverage toll a swap may pay when it drains a leg below its coverage floor stays in the leg's reserves as a buffer and is not counted.",
+    "Swap fee charged on the output token of each swap (protocol share plus LP share), read from the Swapped event, plus the route fee a v2 liability conversion logs on LiabilitySwapped (v1 conversions log none). The coverage toll a swap may pay when it drains a leg below its coverage floor stays in the leg's reserves as a buffer and is not counted.",
   UserFees: "All swap fees are paid by the swapper.",
   Revenue: "Protocol share (protoFee) of the swap fee. Zero on coop fills, which book no protocol fee.",
   ProtocolRevenue: "The protocol share (protoFee) of the swap fee goes to the BTR treasury.",
@@ -156,18 +169,23 @@ const breakdownMethodology = {
   },
   Fees: {
     "Swap Fees": "Swap fee charged on the output token of each swap (protocol share plus LP share).",
+    "Conversion Fees": "Route fee a v2 liability conversion charged on its output token (protocol share plus LP share), read from LiabilitySwapped.",
   },
   UserFees: {
     "Swap Fees": "Swap fee charged on the output token of each swap (protocol share plus LP share).",
+    "Conversion Fees": "Route fee a v2 liability conversion charged on its output token.",
   },
   Revenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee.",
   },
   ProtocolRevenue: {
     "Swap Fees To Protocol": "Protocol share (protoFee) of the swap fee, sent to the BTR treasury.",
+    "Conversion Fees To Protocol": "Protocol share of a v2 liability conversion's route fee, booked to the BTR treasury.",
   },
   SupplySideRevenue: {
     "Swap Fees To LPs": "LP share (lpFee) of the swap fee, accrued to the output leg's liquidity providers.",
+    "Conversion Fees To LPs": "LP share of a v2 liability conversion's route fee, accrued to the output leg's LPs.",
   },
 };
 
